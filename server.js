@@ -3,6 +3,13 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadConsumables, saveConsumables } from "./consumable-store.js";
+import {
+  CATEGORY_STEP, today, remainingOf, batchStatus,
+  validateBatch, validateCheckout, recordRejection,
+  flagAbnormal, reviewHold, activeHoldForSlice
+} from "./consumable-rules.js";
+import { consumablesPage } from "./consumable-page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "core-slices.json");
@@ -75,7 +82,7 @@ const page = `<!doctype html>
   </style>
 </head>
 <body>
-  <header><div><h1>岩芯样本切片实验室</h1><div class="meta">样本、切片任务、制片步骤和交付</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>岩芯样本切片实验室</h1><div class="meta">样本、切片任务、制片步骤和交付</div></div><div style="display:flex;gap:10px;align-items:center"><a class="pill" href="/consumables" style="text-decoration:none">耗材批次台账 →</a><button id="reload">刷新</button></div></header>
   <main>
     <form id="form">
       <h2>创建岩芯样本</h2>
@@ -124,7 +131,12 @@ const page = `<!doctype html>
         await api('/api/samples/'+sampleId+'/slices/'+sliceId+'/logs', { method:'POST', body: JSON.stringify({ step: document.querySelector('[data-step="'+sampleId+'|'+sliceId+'"]').value, note: document.querySelector('[data-note="'+sampleId+'|'+sliceId+'"]').value || "步骤完成" }) });
         await load();
       });
-      document.querySelectorAll("[data-deliver]").forEach(btn => btn.onclick = async () => { await api('/api/samples/'+btn.dataset.deliver+'/deliver', { method:'POST', body: JSON.stringify({}) }); await load(); });
+      document.querySelectorAll("[data-deliver]").forEach(btn => btn.onclick = async () => {
+        try {
+          await api('/api/samples/'+btn.dataset.deliver+'/deliver', { method:'POST', body: JSON.stringify({}) });
+          await load();
+        } catch (error) { alert(error.message); }
+      });
     }
     async function load(){ samples = await api("/api/samples"); render(); }
     document.querySelector("#reload").onclick = load;
@@ -183,10 +195,77 @@ const server = http.createServer(async (req, res) => {
     if (deliverMatch && req.method === "POST") {
       const sample = db.samples.find(item => item.id === deliverMatch[1]);
       if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
+      const cons = await loadConsumables();
+      const held = sample.slices.map(slice => activeHoldForSlice(cons, slice.id)).filter(Boolean);
+      if (held.length) {
+        return sendJson(res, 409, { error: `切片 ${held.map(h => h.sliceId).join("、")} 因异常批次 ${[...new Set(held.map(h => h.batchNo))].join("、")} 停交付中，须换人复核通过后方可交付` });
+      }
       sample.delivery = "已交付";
       updateSampleStatus(sample);
       await saveDb(db);
       return sendJson(res, 200, sample);
+    }
+    if (req.method === "GET" && url.pathname === "/consumables") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(consumablesPage);
+    }
+    if (req.method === "GET" && url.pathname === "/api/consumables") {
+      const cons = await loadConsumables();
+      const slices = db.samples.flatMap(sample => sample.slices.map(slice => ({ sampleId: sample.id, project: sample.project, sliceId: slice.id, method: slice.method, status: slice.status, logs: slice.logs })));
+      return sendJson(res, 200, {
+        today: today(),
+        categoryStep: CATEGORY_STEP,
+        batches: cons.batches.map(batch => ({ ...batch, remaining: remainingOf(cons, batch.batchNo), status: batchStatus(cons, batch) })),
+        checkouts: cons.checkouts,
+        rejected: cons.rejected,
+        holds: cons.holds,
+        slices
+      });
+    }
+    if (req.method === "POST" && url.pathname === "/api/consumables/batches") {
+      const cons = await loadConsumables();
+      const result = validateBatch(cons, await body(req));
+      if (!result.ok) return sendJson(res, 422, { error: result.reason });
+      cons.batches.unshift(result.batch);
+      await saveConsumables(cons);
+      return sendJson(res, 201, result.batch);
+    }
+    if (req.method === "POST" && url.pathname === "/api/consumables/checkouts") {
+      const cons = await loadConsumables();
+      const input = await body(req);
+      const validSlices = new Set(db.samples.flatMap(sample => sample.slices.map(slice => slice.id)));
+      const result = validateCheckout(cons, input, validSlices);
+      if (!result.ok) {
+        recordRejection(cons, input, result.reason);
+        await saveConsumables(cons);
+        return sendJson(res, 422, { error: result.reason });
+      }
+      cons.checkouts.unshift(result.checkout);
+      const batch = cons.batches.find(item => item.batchNo === result.checkout.batchNo);
+      const sample = db.samples.find(item => item.slices.some(slice => slice.id === result.checkout.sliceId));
+      if (sample) {
+        const slice = sample.slices.find(item => item.id === result.checkout.sliceId);
+        slice.logs.push({ at: result.checkout.at, step: result.checkout.step, note: `领用${batch.name}（批号${batch.batchNo}）×${result.checkout.quantity}${batch.unit}，用途：${result.checkout.purpose}` });
+        await saveDb(db);
+      }
+      await saveConsumables(cons);
+      return sendJson(res, 201, result.checkout);
+    }
+    if (req.method === "POST" && url.pathname === "/api/consumables/abnormal") {
+      const cons = await loadConsumables();
+      const input = await body(req);
+      const result = flagAbnormal(cons, String(input.batchNo || "").trim(), String(input.reason || "").trim(), String(input.operator || "").trim() || "未署名");
+      if (!result.ok) return sendJson(res, 422, { error: result.reason });
+      await saveConsumables(cons);
+      return sendJson(res, 200, result);
+    }
+    if (req.method === "POST" && url.pathname === "/api/consumables/reviews") {
+      const cons = await loadConsumables();
+      const input = await body(req);
+      const result = reviewHold(cons, String(input.holdId || ""), input);
+      if (!result.ok) return sendJson(res, 422, { error: result.reason });
+      await saveConsumables(cons);
+      return sendJson(res, 200, result.hold);
     }
     sendJson(res, 404, { error: "not_found" });
   } catch (error) {
